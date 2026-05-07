@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -17,6 +18,13 @@ If the context is insufficient, say what is missing.
 Always cite the relevant Cap/section/date/source URL.
 Do not give legal advice. Say that the answer is for legal information retrieval only.
 Answer in the same language as the user's question."""
+
+
+REWRITE_PROMPT = """Rewrite the user's question into concise English keyword queries for searching Hong Kong legislation.
+Use terms likely to appear in statute text, such as creditor's petition, prescribed amount, statutory demand, liquidated sum, licence, offence, authority, employment contract.
+Return only JSON in this shape:
+{"queries":["query one","query two","query three"]}
+Do not answer the question."""
 
 
 def format_context(rows):
@@ -75,6 +83,18 @@ def openai_client(api_key, base_url=None):
     return OpenAI(api_key=api_key)
 
 
+def chat_text(client, model, system_prompt, user_prompt, temperature=0.2):
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+    )
+    return response.choices[0].message.content.strip()
+
+
 def call_openai(model, question, context):
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -107,15 +127,7 @@ def call_openai(model, question, context):
 
 
 def call_chat_completions(client, model, question, context):
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(question, context)},
-        ],
-        temperature=0.2,
-    )
-    return response.choices[0].message.content.strip()
+    return chat_text(client, model, SYSTEM_PROMPT, build_user_prompt(question, context))
 
 
 def answer_with_model(provider, model, question, context):
@@ -133,10 +145,83 @@ def answer_with_model(provider, model, question, context):
     return call_openai(model or DEFAULT_MODEL, question, context)
 
 
+def parse_rewrite_json(text):
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if "\n" in text:
+            text = text.split("\n", 1)[1]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1:
+        return []
+    try:
+        payload = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return []
+    queries = payload.get("queries", [])
+    return [q.strip() for q in queries if isinstance(q, str) and q.strip()]
+
+
+def rewrite_queries(provider, model, question):
+    if provider != "glm":
+        return []
+
+    api_key = os.environ.get("GLM_API_KEY")
+    if not api_key:
+        return []
+
+    client = openai_client(api_key, base_url=GLM_BASE_URL)
+    text = chat_text(
+        client,
+        model or DEFAULT_GLM_MODEL,
+        REWRITE_PROMPT,
+        question,
+        temperature=0,
+    )
+    return parse_rewrite_json(text)
+
+
+def merge_rows(existing, new_rows, limit):
+    seen = {row["citation"] + row["text"][:120] for row in existing}
+    merged = list(existing)
+    for row in new_rows:
+        key = row["citation"] + row["text"][:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def retrieve_rows(db_path, question, limit, provider, model, use_rewrite=True):
+    search_limit = max(limit, 3)
+    rows = search(db_path, question, search_limit)
+    queries = []
+
+    if use_rewrite and len(rows) < limit:
+        queries = rewrite_queries(provider, model, question)
+        for query in queries:
+            rows = merge_rows(rows, search(db_path, query, search_limit), limit)
+            if len(rows) >= limit:
+                break
+
+    return rows[:limit], queries
+
+
 def print_context(rows):
     print("\nRetrieved context:")
     for idx, row in enumerate(rows, start=1):
         print(f"{idx}. {row['citation']} | {row['date']} | {row['source_url']}")
+
+
+def print_queries(question, queries):
+    print("\nSearch queries:")
+    print(f"0. {question}")
+    for idx, query in enumerate(queries, start=1):
+        print(f"{idx}. {query}")
 
 
 def main():
@@ -148,6 +233,8 @@ def main():
     parser.add_argument("--provider", choices=["auto", "glm", "openai"], default="auto", help="Model provider to use.")
     parser.add_argument("--model", default=None, help="Model to use. Defaults to glm-4.7-flash for GLM or gpt-4.1-mini for OpenAI.")
     parser.add_argument("--show-context", action="store_true", help="Print retrieved citations before the answer.")
+    parser.add_argument("--show-queries", action="store_true", help="Print the original and rewritten search queries.")
+    parser.add_argument("--no-rewrite", action="store_true", help="Disable model-assisted search query rewriting.")
     parser.add_argument("--context-only", action="store_true", help="Only retrieve context; do not call OpenAI.")
     args = parser.parse_args()
 
@@ -155,19 +242,29 @@ def main():
     if not db_path.exists():
         raise SystemExit(f"Database not found: {db_path}. Run scripts/build_index.py first.")
 
-    rows = search(db_path, args.question, args.limit)
+    provider = args.provider
+    if provider == "auto":
+        provider = "glm" if os.environ.get("GLM_API_KEY") else "openai"
+
+    rows, queries = retrieve_rows(
+        db_path,
+        args.question,
+        args.limit,
+        provider,
+        args.model,
+        use_rewrite=not args.no_rewrite,
+    )
     if not rows:
-        raise SystemExit("No relevant legislation chunks found. Try a more specific English query.")
+        raise SystemExit("No relevant legislation chunks found.")
+
+    if args.show_queries:
+        print_queries(args.question, queries)
 
     if args.show_context or args.context_only:
         print_context(rows)
 
     if args.context_only:
         return
-
-    provider = args.provider
-    if provider == "auto":
-        provider = "glm" if os.environ.get("GLM_API_KEY") else "openai"
 
     answer = answer_with_model(provider, args.model, args.question, format_context(rows))
     print(answer)

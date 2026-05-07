@@ -77,6 +77,12 @@ python3 scripts/ask.py "What licence is required for dangerous goods?" --context
 python3 scripts/ask.py "What licence is required for dangerous goods?" --show-context
 ```
 
+程序会自动把普通问题改写成更贴近法例原文的英文检索关键词。如果想看它改写了哪些 query：
+
+```bash
+python3 scripts/ask.py "What is the minimum debt threshold in Hong Kong dollars required to file for bankruptcy?" --show-queries --show-context
+```
+
 默认会优先使用 GLM，模型是 `glm-4.7-flash`。如果你想手动指定：
 
 ```bash
