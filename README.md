@@ -53,7 +53,13 @@ python3 scripts/search.py "dangerous goods licence" --limit 10
 python3 -m pip install -r requirements.txt
 ```
 
-然后设置 API Key：
+然后设置 API Key。如果用 GLM，在 `.env` 里放：
+
+```bash
+GLM_API_KEY="your_glm_api_key_here"
+```
+
+如果用 OpenAI，则设置：
 
 ```bash
 export OPENAI_API_KEY="your_api_key_here"
@@ -71,10 +77,16 @@ python3 scripts/ask.py "What licence is required for dangerous goods?" --context
 python3 scripts/ask.py "What licence is required for dangerous goods?" --show-context
 ```
 
-默认模型是 `gpt-4.1-mini`。如果你想换模型：
+默认会优先使用 GLM，模型是 `glm-4.7-flash`。如果你想手动指定：
 
 ```bash
-python3 scripts/ask.py "What licence is required for dangerous goods?" --model gpt-4.1
+python3 scripts/ask.py "What licence is required for dangerous goods?" --provider glm --model glm-4.7-flash
+```
+
+如果你想换成 OpenAI：
+
+```bash
+python3 scripts/ask.py "What licence is required for dangerous goods?" --provider openai --model gpt-4.1-mini
 ```
 
 注意：这个工具只用于法律资料检索，不是法律意见。
