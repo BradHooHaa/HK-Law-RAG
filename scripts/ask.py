@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 from search import search
@@ -10,6 +11,7 @@ from search import search
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_GLM_MODEL = "glm-4.7-flash"
 GLM_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
+MAX_MODEL_RETRIES = 2
 
 
 SYSTEM_PROMPT = """You answer questions about Hong Kong legislation.
@@ -83,16 +85,30 @@ def openai_client(api_key, base_url=None):
     return OpenAI(api_key=api_key)
 
 
-def chat_text(client, model, system_prompt, user_prompt, temperature=0.2):
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=temperature,
-    )
-    return response.choices[0].message.content.strip()
+def is_rate_limit_error(exc):
+    status_code = getattr(exc, "status_code", None)
+    return status_code == 429 or exc.__class__.__name__ == "RateLimitError"
+
+
+def chat_text(client, model, system_prompt, user_prompt, temperature=0.2, retries=MAX_MODEL_RETRIES):
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as exc:
+            last_error = exc
+            if not is_rate_limit_error(exc) or attempt >= retries:
+                raise
+            time.sleep(2 + attempt * 3)
+    raise last_error
 
 
 def call_openai(model, question, context):
@@ -172,14 +188,52 @@ def rewrite_queries(provider, model, question):
         return []
 
     client = openai_client(api_key, base_url=GLM_BASE_URL)
-    text = chat_text(
-        client,
-        model or DEFAULT_GLM_MODEL,
-        REWRITE_PROMPT,
-        question,
-        temperature=0,
-    )
+    try:
+        text = chat_text(
+            client,
+            model or DEFAULT_GLM_MODEL,
+            REWRITE_PROMPT,
+            question,
+            temperature=0,
+            retries=1,
+        )
+    except Exception:
+        return []
     return parse_rewrite_json(text)
+
+
+def heuristic_rewrite_queries(question):
+    q = question.lower()
+    queries = []
+
+    if "bankrupt" in q and ("threshold" in q or "debt" in q or "dollar" in q):
+        queries.extend(
+            [
+                "creditor's petition debt amount bankruptcy",
+                "grounds creditor petition prescribed amount bankruptcy",
+                "liquidated sum petitioning creditor bankruptcy",
+            ]
+        )
+
+    if "dangerous goods" in q and ("licence" in q or "license" in q):
+        queries.extend(
+            [
+                "dangerous goods licence",
+                "licence required manufacture store convey use dangerous goods",
+                "supplying labour vessels equipment dangerous goods licence",
+            ]
+        )
+
+    if "employment" in q and ("wage" in q or "contract" in q):
+        queries.extend(
+            [
+                "employment contract wages",
+                "employer pay wages contract employment",
+                "completion contract wages employee",
+            ]
+        )
+
+    return queries
 
 
 def merge_rows(existing, new_rows, limit):
@@ -202,8 +256,17 @@ def retrieve_rows(db_path, question, limit, provider, model, use_rewrite=True):
     queries = []
 
     if use_rewrite and len(rows) < limit:
-        queries = rewrite_queries(provider, model, question)
+        queries = heuristic_rewrite_queries(question)
         for query in queries:
+            rows = merge_rows(rows, search(db_path, query, search_limit), limit)
+            if len(rows) >= limit:
+                break
+
+    if use_rewrite and len(rows) < limit:
+        model_queries = rewrite_queries(provider, model, question)
+        for query in model_queries:
+            if query not in queries:
+                queries.append(query)
             rows = merge_rows(rows, search(db_path, query, search_limit), limit)
             if len(rows) >= limit:
                 break
@@ -266,7 +329,16 @@ def main():
     if args.context_only:
         return
 
-    answer = answer_with_model(provider, args.model, args.question, format_context(rows))
+    try:
+        answer = answer_with_model(provider, args.model, args.question, format_context(rows))
+    except Exception as exc:
+        if is_rate_limit_error(exc):
+            raise SystemExit(
+                "The model provider is busy and returned rate limit 429. "
+                "Retrieved context is shown above if you used --show-context. "
+                "Please retry in a minute, or run with --context-only."
+            ) from exc
+        raise
     print(answer)
 
 
